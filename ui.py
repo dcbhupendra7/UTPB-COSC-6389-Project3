@@ -1,150 +1,192 @@
 import tkinter as tk
-from tkinter import ttk
-import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from image_classifier_nn import load_dataset, compute_accuracy, ConvLayer, FullyConnected, SoftmaxLayer  
-from sklearn.model_selection import train_test_split
+from cnn import SimpleCNN, softmax, softmax_derivative
+import numpy as np
+import pandas as pd
+from PIL import Image, ImageTk
+import os
 
-class TrainingVisualizer:
-    def __init__(self, master):
-        # Main window setup
-        self.master = master
-        self.master.title("Neural Network Training Visualization")
-        self.master.geometry("900x700")
 
-        # Frames
-        self.main_frame = ttk.Frame(self.master)
-        self.main_frame.pack(fill=tk.BOTH, expand=True)
+# Helper Function to Load Dataset
+def load_training_data(csv_file, image_folder, image_size=(64, 64)):
+    data = []
+    labels = []
+    df = pd.read_csv(csv_file)
+    class_names = sorted(df['label'].unique())
+    class_to_idx = {cls: idx for idx, cls in enumerate(class_names)}
 
-        # Add matplotlib plots
-        self.figure = Figure(figsize=(8, 4), dpi=100)
-        self.loss_ax = self.figure.add_subplot(211)
-        self.acc_ax = self.figure.add_subplot(212)
+    for _, row in df.iterrows():
+        try:
+            img_path = os.path.join(image_folder, row['image_name'])
+            img = Image.open(img_path).convert('RGB')
+            img = img.resize(image_size)
+            data.append(np.array(img) / 255.0)  # Normalize
+            labels.append(class_to_idx[row['label']])
+        except Exception as e:
+            print(f"Error loading image {row['image_name']}: {e}")
 
-        self.loss_ax.set_title("Training Loss")
-        self.loss_ax.set_xlabel("Epochs")
-        self.loss_ax.set_ylabel("Loss")
+    data = np.array(data)
+    labels_one_hot = np.zeros((len(labels), len(class_names)))
+    labels_one_hot[np.arange(len(labels)), labels] = 1
 
-        self.acc_ax.set_title("Validation Accuracy")
-        self.acc_ax.set_xlabel("Epochs")
-        self.acc_ax.set_ylabel("Accuracy (%)")
+    return data, labels_one_hot, class_names
 
-        # Adjust layout to fix overlapping text
-        self.figure.tight_layout(pad=3.0)
-        self.figure.subplots_adjust(hspace=0.5)
 
-        self.loss_plot = None
-        self.acc_plot = None
+# CNNVisualizer Class
+class CNNVisualizer:
+    def __init__(self, root, cnn_model, data_train, labels_train, class_names):
+        self.root = root
+        self.cnn_model = cnn_model
+        self.data_train = data_train
+        self.labels_train = labels_train
+        self.class_names = class_names
+        self.losses = []
+        self.accuracies = []
 
-        self.canvas = FigureCanvasTkAgg(self.figure, self.main_frame)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        # UI Layout: Split into Graph, Network, and Image Visualizations
+        self.network_canvas = tk.Canvas(root, width=400, height=600, bg="white")
+        self.network_canvas.grid(row=0, column=0, rowspan=2, padx=10, pady=10)
 
-        # Info Frame for epoch details
-        self.info_frame = ttk.Frame(self.master)
-        self.info_frame.pack(side=tk.BOTTOM, fill=tk.X)
-        self.info_label = ttk.Label(self.info_frame, text="Training Progress: Waiting to start...", anchor="w")
-        self.info_label.pack(side=tk.LEFT, padx=5)
+        self.figure = Figure(figsize=(5, 4), dpi=100)
+        self.ax_loss = self.figure.add_subplot(211)
+        self.ax_accuracy = self.figure.add_subplot(212)
+        self.figure.subplots_adjust(hspace=0.8)
 
-        # Training data storage
-        self.training_loss = []
-        self.validation_accuracy = []
+        self.graph_canvas = FigureCanvasTkAgg(self.figure, master=self.root)
+        self.graph_canvas.get_tk_widget().grid(row=0, column=1, padx=10, pady=10)
 
-    def update_metrics(self, epoch, loss, accuracy):
-        """Update training metrics in real-time."""
-        self.training_loss.append(loss)
-        self.validation_accuracy.append(accuracy)
+        # Label to show exact accuracy and loss
+        self.info_label = tk.Label(root, text="Loss: N/A, Accuracy: N/A", font=("Arial", 14))
+        self.info_label.grid(row=1, column=1, padx=10, pady=10)
 
-        # Update loss plot
-        if self.loss_plot:
-            self.loss_plot.remove()
-        self.loss_plot, = self.loss_ax.plot(range(1, len(self.training_loss) + 1), self.training_loss, label="Loss", color="blue")
+        # Predicted and True Image Canvases
+        self.predicted_image_canvas = tk.Canvas(root, width=150, height=150, bg="white", highlightthickness=1)
+        self.predicted_image_canvas.grid(row=2, column=0, padx=10, pady=10)
+        self.predicted_label = tk.Label(root, text="Predicted Image", font=("Arial", 12))
+        self.predicted_label.grid(row=3, column=0)
 
-        # Update accuracy plot
-        if self.acc_plot:
-            self.acc_plot.remove()
-        self.acc_plot, = self.acc_ax.plot(range(1, len(self.validation_accuracy) + 1), self.validation_accuracy, label="Accuracy", color="green")
+        self.true_image_canvas = tk.Canvas(root, width=150, height=150, bg="white", highlightthickness=1)
+        self.true_image_canvas.grid(row=2, column=1, padx=10, pady=10)
+        self.true_label = tk.Label(root, text="True Image", font=("Arial", 12))
+        self.true_label.grid(row=3, column=1)
 
-        self.loss_ax.legend()
-        self.acc_ax.legend()
+        self.start_button = tk.Button(root, text="Start Training", command=self.start_training)
+        self.start_button.grid(row=4, column=0, columnspan=2, pady=10)
 
-        # Refresh canvas and flush events for responsiveness
-        self.canvas.draw()
-        self.canvas.flush_events()
+        self.tk_predicted_image = None
+        self.tk_true_image = None
 
-        # Update progress in info label
-        self.info_label.config(text=f"Training Progress: Epoch {epoch}, Loss: {loss:.4f}, Accuracy: {accuracy:.2f}%")
+    def draw_network(self):
+        """Draw a neural network visualization with dynamic connection colors."""
+        self.network_canvas.delete("all")
+        # Positions and Neurons Per Layer
+        layer_positions = [100, 200, 300]
+        neurons_per_layer = [5, 10, len(self.class_names)]
+        layer_colors = ["lightblue", "lightgreen", "lightcoral"]
 
-    def finalize(self):
-        """Finalize the training process."""
-        self.info_label.config(text="Training Completed!")
-        self.canvas.draw()
+        connection_weights = [
+            self.cnn_model.fc1.weights,
+            self.cnn_model.fc2.weights,
+        ]
 
-# Training logic
-def train(network, X_train, y_train, X_val, y_val, batch_size=32, epochs=10, visualizer=None):
-    num_batches = len(X_train) // batch_size
+        def get_color(weight):
+            intensity = max(0, min(255, int((weight + 1) * 127.5)))
+            return f"#{intensity:02x}{intensity:02x}ff"
 
-    for epoch in range(epochs):
-        total_loss = 0
-        for batch in range(num_batches):
-            start = batch * batch_size
-            end = start + batch_size
+        for layer_index, x in enumerate(layer_positions):
+            y_positions = np.linspace(50, 550, neurons_per_layer[layer_index])
+            for y in y_positions:
+                self.network_canvas.create_oval(
+                    x - 10, y - 10, x + 10, y + 10, fill=layer_colors[layer_index], outline="black"
+                )
 
-            X_batch = X_train[start:end]
-            y_batch = y_train[start:end]
+            if layer_index < len(layer_positions) - 1:
+                next_y_positions = np.linspace(50, 550, neurons_per_layer[layer_index + 1])
+                weights = connection_weights[layer_index]
+                for i, y1 in enumerate(y_positions):
+                    for j, y2 in enumerate(next_y_positions):
+                        color = get_color(weights[i, j])
+                        self.network_canvas.create_line(
+                            x + 10, y1, layer_positions[layer_index + 1] - 10, y2, fill=color
+                        )
 
-            output = X_batch
-            for layer in network[:-1]:  # Exclude softmax layer
-                output = layer.forward(output)
+    def update_graph(self, epoch, loss, accuracy):
+        """Update the graphs for loss and accuracy."""
+        self.losses.append(loss)
+        self.accuracies.append(accuracy)
 
-            predictions = network[-1].forward(output)
-            loss = -np.mean(np.log(predictions[range(len(y_batch)), y_batch] + 1e-10))
-            total_loss += loss
+        self.ax_loss.clear()
+        self.ax_loss.plot(self.losses, label="Loss", color="blue")
+        self.ax_loss.set_title("Training Loss")
+        self.ax_loss.set_xlabel("Epoch")
+        self.ax_loss.set_ylabel("Loss")
+        self.ax_loss.legend()
 
-            network[-1].backward(y_batch)
-            d_output = network[-1].input
+        self.ax_accuracy.clear()
+        self.ax_accuracy.plot(self.accuracies, label="Accuracy", color="green")
+        self.ax_accuracy.set_title("Training Accuracy")
+        self.ax_accuracy.set_xlabel("Epoch")
+        self.ax_accuracy.set_ylabel("Accuracy")
+        self.ax_accuracy.legend()
 
-            for layer in reversed(network[:-1]):
-                d_output = layer.backward(d_output)
+        self.graph_canvas.draw()
+        self.info_label.config(text=f"Epoch: {epoch} | Loss: {loss:.4f} | Accuracy: {accuracy:.2f}%")
 
-        # Validation
-        val_output = X_val
-        for layer in network[:-1]:
-            val_output = layer.forward(val_output)
+    def display_images(self, predicted_image, true_image):
+        """Display the predicted and true images on the UI."""
+        predicted_pil_image = Image.fromarray((predicted_image * 255).astype(np.uint8))
+        true_pil_image = Image.fromarray((true_image * 255).astype(np.uint8))
 
-        val_predictions = network[-1].forward(val_output)
-        val_accuracy = compute_accuracy(val_predictions, y_val)
+        predicted_pil_image = predicted_pil_image.resize((150, 150))
+        true_pil_image = true_pil_image.resize((150, 150))
 
-        # Update the visualizer
-        if visualizer:
-            visualizer.update_metrics(epoch + 1, total_loss / num_batches, val_accuracy)
+        self.tk_predicted_image = ImageTk.PhotoImage(predicted_pil_image)
+        self.tk_true_image = ImageTk.PhotoImage(true_pil_image)
 
-        print(f"Epoch {epoch + 1}, Average Loss: {total_loss / num_batches:.4f}, Validation Accuracy: {val_accuracy:.2f}%")
+        self.predicted_image_canvas.create_image(75, 75, image=self.tk_predicted_image)
+        self.true_image_canvas.create_image(75, 75, image=self.tk_true_image)
 
-    if visualizer:
-        visualizer.finalize()
+    def start_training(self):
+        """Train the CNN model on the loaded dataset."""
+        self.losses.clear()
+        self.accuracies.clear()
 
-# Main function
-def main():
-    # Load dataset
-    dataset_path = "dataset"
-    X, y = load_dataset(dataset_path, max_images=1000)
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+        for epoch in range(1, 101):
+            example_image = self.data_train[epoch % len(self.data_train)]
+            target = self.labels_train[epoch % len(self.labels_train)]
 
-    # Define the network
-    network = [
-        ConvLayer(8, 3, 1),
-        FullyConnected(8 * 26 * 26, 128),
-        SoftmaxLayer(128, 10)
-    ]
+            output = softmax(self.cnn_model.forward(example_image[np.newaxis, :]))
+            loss = -np.sum(target * np.log(output))
 
-    # Setup Tkinter UI
-    root = tk.Tk()
-    visualizer = TrainingVisualizer(root)
+            grad = softmax_derivative(output, target[np.newaxis, :])
+            self.cnn_model.backward(grad)
+            self.cnn_model.update(learning_rate=0.01)
 
-    # Start training
-    root.after(100, train, network, X_train, y_train, X_val, y_val, 32, 10, visualizer)
-    root.mainloop()
+            predicted_class = np.argmax(output)
+            true_class = np.argmax(target)
+            accuracy = 100.0 if predicted_class == true_class else 0.0
 
+            predicted_image = self.data_train[predicted_class]
+            true_image = example_image
+
+            self.display_images(predicted_image, true_image)
+            self.draw_network()
+            self.update_graph(epoch, loss, accuracy)
+
+            self.root.update()
+            self.root.after(500)
+
+
+# Main Entry
 if __name__ == "__main__":
-    main()
+    train_csv = "./dataset/Training_set.csv"
+    train_folder = "./dataset/train"
+    data_train, labels_train, class_names = load_training_data(train_csv, train_folder)
+
+    root = tk.Tk()
+    root.title("CNN Training Visualization")
+    cnn = SimpleCNN(input_shape=(64, 64, 3), num_classes=len(class_names))
+
+    visualizer = CNNVisualizer(root, cnn, data_train, labels_train, class_names)
+    root.mainloop()
